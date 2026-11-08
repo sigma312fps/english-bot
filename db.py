@@ -1,5 +1,7 @@
-import sqlite3
+import json
 from datetime import date, timedelta
+
+import libsql
 
 import config
 
@@ -9,14 +11,67 @@ LEARNED_BOX = 4
 
 USER_FIELDS = {"name", "level", "scenario", "correction", "voice_reply", "reminders"}
 
-_conn: sqlite3.Connection | None = None
+
+class _Row(tuple):
+    """Рядок результату: доступ за номером і за назвою колонки (libsql повертає звичайні кортежі)."""
+
+    def __new__(cls, values, columns):
+        row = super().__new__(cls, values)
+        row._columns = columns
+        return row
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._columns.index(key) if isinstance(key, str) else key)
+
+    def keys(self):
+        return self._columns
 
 
-def conn() -> sqlite3.Connection:
+class _Cursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = cursor.lastrowid
+        self.rowcount = cursor.rowcount
+
+    def _row(self, values) -> _Row:
+        return _Row(values, [column[0] for column in self._cursor.description])
+
+    def fetchone(self) -> _Row | None:
+        values = self._cursor.fetchone()
+        return self._row(values) if values is not None else None
+
+    def fetchall(self) -> list[_Row]:
+        return [self._row(values) for values in self._cursor.fetchall()]
+
+
+class _Connection:
+    def __init__(self, raw):
+        self._raw = raw
+
+    def execute(self, sql: str, params: tuple = ()) -> _Cursor:
+        return _Cursor(self._raw.execute(sql, params))
+
+    def executescript(self, sql: str):
+        self._raw.executescript(sql)
+
+    def commit(self):
+        self._raw.commit()
+
+
+_conn: _Connection | None = None
+
+
+def conn() -> _Connection:
     global _conn
     if _conn is None:
-        _conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
+        if config.TURSO_URL:
+            # Локальна копія для швидкого читання, а запис іде в Turso. Під час запуску копія наздоганяє хмару
+            raw = libsql.connect(config.TURSO_REPLICA_PATH, sync_url=config.TURSO_URL,
+                                 auth_token=config.TURSO_AUTH_TOKEN)
+            raw.sync()
+        else:
+            raw = libsql.connect(config.DB_PATH)
+        _conn = _Connection(raw)
     return _conn
 
 
@@ -61,6 +116,17 @@ def init():
         CREATE TABLE IF NOT EXISTS groups (
             id INTEGER PRIMARY KEY,
             title TEXT
+        );
+        CREATE TABLE IF NOT EXISTS activity (
+            user_id INTEGER,
+            day TEXT,
+            PRIMARY KEY (user_id, day)
+        );
+        CREATE TABLE IF NOT EXISTS daily_content (
+            kind TEXT,
+            day TEXT,
+            value TEXT,
+            PRIMARY KEY (kind, day)
         );
         """
     )
@@ -237,3 +303,65 @@ def all_groups() -> list[int]:
 def remove_group(chat_id: int):
     conn().execute("DELETE FROM groups WHERE id = ?", (chat_id,))
     conn().commit()
+
+
+# ---------- слово дня / тема дня ----------
+
+def get_daily(kind: str, day: str):
+    row = conn().execute("SELECT value FROM daily_content WHERE kind = ? AND day = ?", (kind, day)).fetchone()
+    return json.loads(row["value"]) if row else None
+
+
+def save_daily(kind: str, day: str, value):
+    conn().execute(
+        "INSERT OR IGNORE INTO daily_content (kind, day, value) VALUES (?, ?, ?)",
+        (kind, day, json.dumps(value, ensure_ascii=False)),
+    )
+    conn().commit()
+
+
+def recent_daily(kind: str, limit: int = 200) -> list:
+    rows = conn().execute(
+        "SELECT value FROM daily_content WHERE kind = ? ORDER BY day DESC LIMIT ?", (kind, limit)
+    ).fetchall()
+    return [json.loads(r["value"]) for r in rows]
+
+
+# ---------- аналітика ----------
+
+def log_activity(uid: int):
+    # Спершу перевіряємо локальну копію, щоб не ходити в Turso на кожне повідомлення
+    if conn().execute("SELECT 1 FROM activity WHERE user_id = ? AND day = ?", (uid, _today())).fetchone():
+        return
+    conn().execute("INSERT OR IGNORE INTO activity (user_id, day) VALUES (?, ?)", (uid, _today()))
+    conn().commit()
+
+
+def _days_ago(days: int) -> str:
+    return (date.today() - timedelta(days=days)).isoformat()
+
+
+def _active_since(day: str) -> int:
+    return conn().execute("SELECT COUNT(DISTINCT user_id) FROM activity WHERE day >= ?", (day,)).fetchone()[0]
+
+
+def _new_users_since(day: str) -> int:
+    return conn().execute("SELECT COUNT(*) FROM users WHERE date(created, 'localtime') >= ?", (day,)).fetchone()[0]
+
+
+def analytics() -> dict:
+    c = conn()
+    by_day = dict(c.execute("SELECT day, COUNT(*) FROM activity WHERE day >= ? GROUP BY day", (_days_ago(6),)).fetchall())
+    return {
+        "users": c.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+        "new_today": _new_users_since(_today()),
+        "new_7d": _new_users_since(_days_ago(6)),
+        "active_today": _active_since(_today()),
+        "active_7d": _active_since(_days_ago(6)),
+        "active_30d": _active_since(_days_ago(29)),
+        "messages": c.execute("SELECT COALESCE(SUM(messages), 0) FROM users").fetchone()[0],
+        "words": c.execute("SELECT COUNT(*) FROM words").fetchone()[0],
+        "groups": c.execute("SELECT COUNT(*) FROM groups").fetchone()[0],
+        "by_day": [(_days_ago(d), by_day.get(_days_ago(d), 0)) for d in range(6, -1, -1)],
+        "since": c.execute("SELECT MIN(date(created, 'localtime')) FROM users").fetchone()[0],
+    }

@@ -145,15 +145,18 @@ for each item one line: "1. ✅" or "1. ❌ правильно: <answer> — к�
 Last line: "Результат: X/5" and a short encouraging phrase."""
 
 
-def word_of_day(seed: str) -> str:
-    return f"""Pick one useful, interesting English word for B1-B2 learners (seed: {seed}, avoid very common words).
+def word_of_day(theme: str, letter: str, used: list[str]) -> str:
+    return f"""Pick one useful, interesting English word for B1-B2 learners (avoid very common words).
+It should be related to the theme "{theme}" and start with the letter "{letter}".
+Do not pick any of these words: {", ".join(used) or "none"}.
 Return JSON:
 {{"word": "...", "transcription": "/.../", "translation": "<Ukrainian>", "example": "<English sentence>", "example_uk": "<Ukrainian translation>"}}"""
 
 
-def discussion_topic(seed: str) -> str:
-    return (f"Give ONE interesting discussion question for an English-learning group chat (seed: {seed}). "
+def discussion_topic(theme: str, used: list[str]) -> str:
+    return (f'Give ONE interesting discussion question about "{theme}" for an English-learning group chat. '
             "It should be easy to answer for B1 learners and make people share opinions or stories. "
+            f"It must be different from these earlier questions: {' | '.join(used) or 'none'}. "
             "Reply with just the question and one relevant emoji, nothing else.")
 
 

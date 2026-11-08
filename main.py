@@ -11,7 +11,7 @@ from aiohttp import web
 
 import config
 import db
-from handlers import chat, grammar, group, partner, placement, start, vocab
+from handlers import admin, chat, grammar, group, partner, placement, start, vocab
 from scheduler import scheduler_loop
 
 COMMANDS = [
@@ -55,7 +55,9 @@ async def main():
     bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     # Порядок важливий: chat.router останній, бо ловить будь-який текст
-    dp.include_routers(group.router, start.router, partner.router, placement.router,
+    dp.message.outer_middleware(admin.track_activity)
+    dp.callback_query.outer_middleware(admin.track_activity)
+    dp.include_routers(group.router, admin.router, start.router, partner.router, placement.router,
                        vocab.router, grammar.router, chat.router)
 
     await bot.set_my_commands(COMMANDS)
